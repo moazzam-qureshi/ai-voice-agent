@@ -1,0 +1,319 @@
+@import "tailwindcss";
+
+/* =========================================================================
+   VoiceGen design tokens — see docs/design.md
+   ========================================================================= */
+
+@theme {
+  /* Background scales */
+  --color-bg-base:        #0A0E12;
+  --color-bg-elevated:    #11161C;
+  --color-bg-subtle:      #161D26;
+
+  /* Borders */
+  --color-border:         #1E2832;
+  --color-border-strong:  #2A3744;
+
+  /* Foreground scales */
+  --color-fg:             #E8EEF4;
+  --color-fg-muted:       #8B98A8;
+  --color-fg-faint:       #5A6878;
+  --color-fg-dim:         #3B4554;
+
+  /* Accent — cyan, the only color */
+  --color-accent:         #5CE1E6;
+  --color-accent-bright:  #82F0F4;
+  --color-accent-deep:    #2DB9BE;
+
+  /* Status (inline icons + badges only — never surfaces) */
+  --color-status-success: #6CE9A6;
+  --color-status-warning: #F2C265;
+  --color-status-error:   #F47273;
+
+  /* Type families */
+  --font-mono:  "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  --font-sans:  "Inter", system-ui, -apple-system, sans-serif;
+}
+
+/* =========================================================================
+   Base layer — html, body defaults
+   ========================================================================= */
+
+html, body {
+  background: var(--color-bg-base);
+  color: var(--color-fg);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+  min-height: 100vh;
+  margin: 0;
+}
+
+/* =========================================================================
+   Design system — reusable typography classes (per design.md type scale)
+   ========================================================================= */
+
+.display-lg {
+  font: 600 44px/56px var(--font-sans);
+  letter-spacing: -0.02em;
+}
+.display {
+  font: 600 32px/40px var(--font-sans);
+}
+.title {
+  font: 500 22px/28px var(--font-sans);
+}
+.body-lg {
+  font: 400 17px/26px var(--font-sans);
+}
+.caption {
+  font: 400 13px/20px var(--font-mono);
+  letter-spacing: 0.02em;
+}
+.mono-label {
+  font: 500 11px/16px var(--font-mono);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--color-fg-muted);
+}
+.mono-label--accent { color: var(--color-accent); }
+.mono-label--bright { color: var(--color-accent-bright); }
+
+/* =========================================================================
+   The primary CTA — the only button with a glow
+   ========================================================================= */
+
+.btn-primary {
+  height: 52px;
+  padding: 0 32px;
+  background: var(--color-accent);
+  color: var(--color-bg-base);
+  border-radius: 8px;
+  border: none;
+  font: 500 14px var(--font-mono);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: transform 80ms ease-out, box-shadow 200ms ease-out;
+  box-shadow:
+    0 0 32px rgba(92, 225, 230, 0.18),
+    inset 0 1px 0 rgba(255, 255, 255, 0.15);
+}
+.btn-primary:hover {
+  transform: scale(1.02);
+  box-shadow:
+    0 0 48px rgba(92, 225, 230, 0.32),
+    inset 0 1px 0 rgba(255, 255, 255, 0.18);
+}
+.btn-primary:active { transform: scale(0.98); }
+.btn-primary:focus-visible {
+  outline: 2px solid var(--color-accent-deep);
+  outline-offset: 4px;
+}
+.btn-primary:disabled {
+  background: var(--color-bg-subtle);
+  color: var(--color-fg-dim);
+  cursor: not-allowed;
+  box-shadow: none;
+  transform: none;
+}
+
+.btn-ghost {
+  height: 44px;
+  padding: 0 24px;
+  background: transparent;
+  border: 1px solid var(--color-border-strong);
+  color: var(--color-fg);
+  border-radius: 8px;
+  font: 500 13px var(--font-mono);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: border-color 200ms ease-out, color 200ms ease-out;
+}
+.btn-ghost:hover {
+  border-color: var(--color-accent);
+  color: var(--color-accent);
+}
+
+/* =========================================================================
+   Card — used by both download cards and the call console
+   ========================================================================= */
+
+.card {
+  background: var(--color-bg-elevated);
+  border: 1px solid var(--color-border);
+  border-radius: 12px;
+  padding: 20px 24px;
+  transition: border-color 200ms ease-out;
+}
+.card:hover { border-color: var(--color-border-strong); }
+
+/* =========================================================================
+   Status pill — used for LIVE indicator + state labels
+   ========================================================================= */
+
+.pill {
+  height: 22px;
+  padding: 0 10px;
+  border-radius: 999px;
+  font: 500 11px var(--font-mono);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.pill--live {
+  background: rgba(244, 114, 115, 0.12);
+  color: var(--color-status-error);
+}
+.pill--live::before {
+  content: "●";
+  color: var(--color-status-error);
+  animation: pulse 1s infinite;
+}
+.pill--thinking {
+  background: rgba(92, 225, 230, 0.12);
+  color: var(--color-accent);
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.6; }
+}
+
+/* =========================================================================
+   Turnstile modal backdrop (per locked Turnstile invariant — modal pattern)
+   ========================================================================= */
+
+.turnstile-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(10, 14, 18, 0.84);
+  backdrop-filter: blur(4px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+.turnstile-modal {
+  background: var(--color-bg-elevated);
+  border: 1px solid var(--color-border-strong);
+  border-radius: 12px;
+  padding: 24px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 16px;
+  /* 300x65 minimum reservation per locked Turnstile invariant —
+     otherwise the visible challenge can't render. */
+  min-width: 332px;
+}
+.turnstile-modal__label {
+  font: 500 11px/16px var(--font-mono);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--color-fg-muted);
+}
+.turnstile-host {
+  width: 300px;
+  height: 65px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* =========================================================================
+   Waveform — see design.md "Waveform implementation notes"
+   ========================================================================= */
+
+.waveform {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  height: 60px;
+}
+.waveform__bar {
+  width: 4px;
+  height: 100%;
+  background: var(--color-accent);
+  border-radius: 1.5px;
+  transform: scaleY(0.08);
+  transform-origin: center;
+  transition: transform 80ms ease-out;
+}
+
+/* Idle pulse — slow sine wave between turns */
+.waveform--idle .waveform__bar {
+  animation: idle-pulse 2s ease-in-out infinite;
+}
+.waveform--idle .waveform__bar:nth-child(2)  { animation-delay: 0.14s; }
+.waveform--idle .waveform__bar:nth-child(3)  { animation-delay: 0.28s; }
+.waveform--idle .waveform__bar:nth-child(4)  { animation-delay: 0.42s; }
+.waveform--idle .waveform__bar:nth-child(5)  { animation-delay: 0.56s; }
+.waveform--idle .waveform__bar:nth-child(6)  { animation-delay: 0.70s; }
+.waveform--idle .waveform__bar:nth-child(7)  { animation-delay: 0.84s; }
+.waveform--idle .waveform__bar:nth-child(8)  { animation-delay: 0.98s; }
+.waveform--idle .waveform__bar:nth-child(9)  { animation-delay: 1.12s; }
+.waveform--idle .waveform__bar:nth-child(10) { animation-delay: 1.26s; }
+.waveform--idle .waveform__bar:nth-child(11) { animation-delay: 1.40s; }
+.waveform--idle .waveform__bar:nth-child(12) { animation-delay: 1.54s; }
+.waveform--idle .waveform__bar:nth-child(13) { animation-delay: 1.68s; }
+.waveform--idle .waveform__bar:nth-child(14) { animation-delay: 1.82s; }
+
+@keyframes idle-pulse {
+  0%, 100% { transform: scaleY(0.08); }
+  50%      { transform: scaleY(0.12); }
+}
+
+/* =========================================================================
+   Transcript styling
+   ========================================================================= */
+
+.transcript-turn {
+  margin-bottom: 16px;
+}
+.transcript-turn__role {
+  font: 500 11px var(--font-mono);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--color-fg-muted);
+  margin-bottom: 4px;
+}
+.transcript-turn__role::before { content: "> "; }
+.transcript-turn__content {
+  font: 400 15px/24px var(--font-sans);
+  color: var(--color-fg);
+}
+.transcript-turn--tool .transcript-turn__content {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--color-fg-faint);
+}
+
+/* =========================================================================
+   Utility — section divider with mono label
+   ========================================================================= */
+
+.divider {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 24px 0 16px;
+}
+.divider__line {
+  flex: 1;
+  height: 1px;
+  background: var(--color-border);
+}
+.divider__label {
+  font: 500 11px var(--font-mono);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--color-fg-faint);
+}
