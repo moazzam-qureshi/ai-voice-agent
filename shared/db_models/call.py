@@ -33,13 +33,6 @@ class Call(Base, UUIDMixin, TimestampMixin):
     # Origin
     client_ip: Mapped[str | None] = mapped_column(INET, nullable=True, index=True)
 
-    # ElevenLabs side
-    elevenlabs_conversation_id: Mapped[str | None] = mapped_column(
-        String(128),
-        index=True,
-        nullable=True,
-    )
-
     # Lifecycle
     started_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),
