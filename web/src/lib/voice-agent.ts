@@ -127,7 +127,9 @@ export function createVoiceAgentSession(opts: {
     // recorder + waveform can tap into.
     agentAudioEl = document.createElement("audio");
     agentAudioEl.autoplay = true;
-    agentAudioEl.playsInline = true;
+    // playsinline is only typed on HTMLVideoElement, but iOS Safari respects
+    // the attribute on <audio> too and refuses inline playback without it.
+    agentAudioEl.setAttribute("playsinline", "");
     // Hidden but present in the DOM (Safari needs the element attached
     // to the document for some media operations).
     agentAudioEl.style.display = "none";
