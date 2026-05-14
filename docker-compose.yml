@@ -1,0 +1,140 @@
+# VoiceGen AI production compose — deployed on Coolify.
+#
+# Coolify handles:
+#   - Domain routing + SSL (set the web service domain to the public host
+#     and the api service domain to the API subdomain with :8000 suffix)
+#   - Traefik labels (added by Coolify, not here)
+#   - Persistent volume management
+#
+# Environment variables come from .env (see .env.example for the full list).
+
+services:
+  # === Frontend ===
+  web:
+    build:
+      context: ./web
+      args:
+        NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-}
+        NEXT_PUBLIC_TURNSTILE_SITEKEY: ${NEXT_PUBLIC_TURNSTILE_SITEKEY:-}
+        NEXT_PUBLIC_ELEVENLABS_AGENT_ID: ${NEXT_PUBLIC_ELEVENLABS_AGENT_ID:-}
+    environment:
+      NODE_ENV: production
+    depends_on:
+      - api
+    healthcheck:
+      disable: true
+    restart: unless-stopped
+
+  # === API (FastAPI) ===
+  api:
+    build:
+      context: .
+      dockerfile: services/api/Dockerfile
+    env_file: .env
+    volumes:
+      - voicegen_data:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      opensearch:
+        condition: service_healthy
+    healthcheck:
+      disable: true
+    restart: unless-stopped
+
+  # === Worker (Dramatiq — PDF gen, Discord notify, audio fetch, ingest) ===
+  worker:
+    build:
+      context: .
+      dockerfile: services/worker/Dockerfile
+    env_file: .env
+    command: ["dramatiq", "worker.main", "--processes", "1", "--threads", "2"]
+    volumes:
+      - voicegen_data:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      opensearch:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # === Scheduler (APScheduler — hourly cleanup) ===
+  scheduler:
+    build:
+      context: .
+      dockerfile: services/worker/Dockerfile
+    env_file: .env
+    command: ["python", "-m", "worker.scheduler"]
+    volumes:
+      - voicegen_data:/data
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # === Persistence ===
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: voicegen
+      POSTGRES_PASSWORD: voicegen
+      POSTGRES_DB: voicegen
+    volumes:
+      - voicegen_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U voicegen"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  opensearch:
+    image: opensearchproject/opensearch:2.18.0
+    environment:
+      - discovery.type=single-node
+      - bootstrap.memory_lock=true
+      - DISABLE_SECURITY_PLUGIN=true
+      - DISABLE_INSTALL_DEMO_CONFIG=true
+      - "OPENSEARCH_JAVA_OPTS=-Xms1g -Xmx1g"
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    volumes:
+      - voicegen_os_data:/usr/share/opensearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
+  # === Migrations (runs once on each deploy) ===
+  migrate:
+    build:
+      context: .
+      dockerfile: services/api/Dockerfile
+    env_file: .env
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+volumes:
+  voicegen_pg_data:
+  voicegen_os_data:
+  voicegen_data:

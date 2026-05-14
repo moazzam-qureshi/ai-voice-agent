@@ -1,0 +1,42 @@
+# Env / secrets
+.env
+.env.local
+.env.real-keys
+.env.clean
+*.env
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# uv
+.python-version
+
+# Node / Next.js
+node_modules/
+.next/
+out/
+.vercel/
+*.tsbuildinfo
+next-env.d.ts
+
+# Runtime data (recordings, generated PDFs, knowledge PDFs)
+data/calls/*
+data/knowledge/*
+!data/calls/.gitkeep
+!data/knowledge/.gitkeep
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db

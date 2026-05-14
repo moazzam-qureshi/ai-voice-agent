@@ -1,0 +1,41 @@
+# Local-dev overlay for the full Docker stack.
+#
+# Used with the production compose, NOT instead of it:
+#   docker compose -f docker-compose.yml -f docker-compose.local.yml up -d --build
+#
+# Differences from prod:
+#   - Exposes web (3000) and api (8000) to your host
+#   - Builds the web image with NEXT_PUBLIC_API_BASE_URL=http://localhost:8000
+#   - Forwards Turnstile + ElevenLabs agent ID build args (per the locked
+#     Turnstile invariant in CLAUDE.md — overlays must forward NEXT_PUBLIC_*
+#     or the bundle silently drops them at build time)
+#   - Exposes postgres (5433) and opensearch (9200) for debugging
+#   - Lighter OpenSearch heap for local machines
+
+services:
+  web:
+    build:
+      args:
+        NEXT_PUBLIC_API_BASE_URL: "http://localhost:8000"
+        NEXT_PUBLIC_TURNSTILE_SITEKEY: ${NEXT_PUBLIC_TURNSTILE_SITEKEY:-1x00000000000000000000AA}
+        NEXT_PUBLIC_ELEVENLABS_AGENT_ID: ${NEXT_PUBLIC_ELEVENLABS_AGENT_ID:-}
+    ports:
+      - "3000:3000"
+
+  api:
+    ports:
+      - "8000:8000"
+
+  postgres:
+    ports:
+      - "5433:5432"
+
+  opensearch:
+    environment:
+      - discovery.type=single-node
+      - bootstrap.memory_lock=true
+      - DISABLE_SECURITY_PLUGIN=true
+      - DISABLE_INSTALL_DEMO_CONFIG=true
+      - "OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx512m"
+    ports:
+      - "9200:9200"
