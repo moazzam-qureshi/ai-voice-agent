@@ -33,7 +33,7 @@ from api.db.session import get_db
 from shared.db_models import Call, CallStatus
 from shared.deepgram import DeepgramError, build_agent_settings, grant_token
 from shared.guardrails.client_ip import get_client_ip
-from shared.guardrails.cost_ceiling import consume_cost_units, cost_remaining
+from shared.guardrails.cost_ceiling import consume_cost_units
 from shared.guardrails.turnstile import verify_turnstile_token
 
 logger = structlog.get_logger(__name__)
@@ -83,14 +83,16 @@ async def call_start(
 
     redis = get_redis()
 
-    # 2. Per-IP daily call count
-    remaining = cost_remaining(
+    # 2. Per-IP daily call count — atomic check-and-reserve. Two concurrent
+    #    starts from the same IP can't both squeak past a TOCTOU window.
+    ip_accepted = consume_cost_units(
         redis,
         ip=client_ip,
+        units=1,
         max_units=settings.call_max_per_ip_per_day,
         namespace="voicegen:calls",
     )
-    if remaining <= 0:
+    if not ip_accepted:
         raise HTTPException(
             status_code=429,
             detail=(
@@ -100,7 +102,7 @@ async def call_start(
             ),
         )
 
-    # 3. Global daily cost ceiling (USD cents). 30 cents per call estimate.
+    # 3. Global daily cost ceiling (USD cents). ~30 cents per call estimate.
     max_cents = settings.global_daily_cost_usd_limit * 100
     accepted = consume_cost_units(
         redis,
@@ -123,28 +125,20 @@ async def call_start(
             ),
         )
 
-    # 4. Mint the Deepgram JWT
+    # 4. Mint the Deepgram JWT.
+    # Note: the per-IP and global counters were already consumed above. If
+    # grant_token fails here, we've burned 1 IP-call-slot + 30c of global
+    # budget without an actual call. Acceptable failure mode for a portfolio
+    # demo (Deepgram outages are rare); add a refund-on-error path if
+    # production traffic ever justifies it.
     try:
         token_resp = await grant_token(
             api_key=settings.deepgram_api_key,
             ttl_seconds=settings.deepgram_grant_token_ttl_seconds,
         )
     except DeepgramError as e:
-        # Refund the cost-ceiling reservation since the call won't happen.
-        # No transactional decrement helper; the Lua script only adds.
-        # Acceptable: a failed grant once per day still uses 30c of the
-        # budget. Worth fixing if we see real Deepgram outages.
         logger.error("deepgram_grant_failed_in_call_start", error=str(e))
         raise HTTPException(status_code=502, detail="voice_provider_unavailable") from e
-
-    # 5. Bump the per-IP daily call counter NOW that we're committed.
-    consume_cost_units(
-        redis,
-        ip=client_ip,
-        units=1,
-        max_units=settings.call_max_per_ip_per_day,
-        namespace="voicegen:calls",
-    )
 
     # 6. Create the Call row
     expires_at = datetime.now(UTC) + timedelta(hours=settings.call_ttl_hours)
