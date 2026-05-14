@@ -84,5 +84,10 @@ class Settings(BaseSettings):
     # === Storage paths (mounted via docker volume) ===
     data_dir: str = "/data"
 
+    # === Admin (knowledge-base management) ===
+    # Bearer token required on all /admin/* endpoints. If empty, /admin/*
+    # returns 403 (locked by default; explicit opt-in).
+    admin_token: str = ""
+
 
 settings = Settings()
