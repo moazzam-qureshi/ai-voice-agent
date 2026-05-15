@@ -25,7 +25,7 @@ What makes it different from a typical voice-agent demo:
   `FunctionCallRequest` for `search_background`; the browser routes it
   to our FastAPI `/agent/search` endpoint, which runs OpenSearch BM25 +
   kNN hybrid retrieval over a page-level index built by a vision-LLM
-  ingestion pipeline (Gemini 2.5 Flash via OpenRouter). The agent quotes
+  ingestion pipeline (Qwen 2.5 VL 72B via OpenRouter). The agent quotes
   real content from real documents — no hallucinated capabilities, no
   invented promises.
 - **Agent-as-code, no dashboard.** The system prompt, voice, LLM
