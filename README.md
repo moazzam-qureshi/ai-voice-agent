@@ -6,7 +6,7 @@
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-[Architecture](docs/architecture.md) · [Design system](docs/design.md)
+[Try the demo →](https://m0g4ssw40wocskckg08owwo0.65.108.2.94.sslip.io/) · [Architecture](docs/architecture.md) · [Design system](docs/design.md)
 
 </div>
 
