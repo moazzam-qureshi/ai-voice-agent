@@ -170,7 +170,6 @@ async def call_start(
         "call_started",
         call_id=call_id,
         client_ip=client_ip,
-        ip_calls_remaining=remaining - 1,
     )
 
     return CallStartResponse(

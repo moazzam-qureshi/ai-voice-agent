@@ -1,8 +1,9 @@
 "use client";
 
 /**
- * Auto-scrolling transcript pane. Each turn rendered with `> AGENT` /
- * `> YOU` mono labels per design.md State 3.
+ * Conversation transcript — left/right bubble layout (agent left, visitor
+ * right), tool calls rendered as centered dashed pills. Auto-scrolls to
+ * the latest turn.
  */
 
 import { useEffect, useRef } from "react";
@@ -26,26 +27,48 @@ export function Transcript({ turns }: { turns: TranscriptTurn[] }) {
     return (
       <div
         ref={ref}
-        className="mono-label"
-        style={{ color: "var(--color-fg-faint)", textAlign: "center", marginTop: "16px" }}
+        className="flex flex-col items-center justify-center h-full"
+        style={{ minHeight: "200px" }}
       >
-        WAITING FOR FIRST TURN…
+        <div
+          className="font-mono mb-2"
+          style={{
+            fontSize: "10px",
+            letterSpacing: "0.12em",
+            color: "var(--color-accent)",
+            animation: "pulse 1.4s ease-in-out infinite",
+          }}
+        >
+          ● ● ●
+        </div>
+        <div
+          className="font-mono"
+          style={{
+            fontSize: "11px",
+            letterSpacing: "0.1em",
+            textTransform: "uppercase",
+            color: "var(--color-fg-faint)",
+          }}
+        >
+          Waiting for first turn
+        </div>
       </div>
     );
   }
 
   return (
-    <div
-      ref={ref}
-      style={{ maxHeight: "320px", overflowY: "auto", paddingRight: "8px" }}
-    >
+    <div ref={ref} className="transcript-v2">
       {turns.map((turn) => (
         <div
           key={turn.id}
-          className={`transcript-turn ${turn.role === "tool" ? "transcript-turn--tool" : ""}`}
+          className={`transcript-v2__turn transcript-v2__turn--${turn.role}`}
         >
-          <div className="transcript-turn__role">{ROLE_LABEL[turn.role]}</div>
-          <div className="transcript-turn__content">{turn.content}</div>
+          <div className="transcript-v2__bubble">
+            {turn.role !== "tool" && (
+              <span className="transcript-v2__role">{ROLE_LABEL[turn.role]}</span>
+            )}
+            <span>{turn.content}</span>
+          </div>
         </div>
       ))}
     </div>

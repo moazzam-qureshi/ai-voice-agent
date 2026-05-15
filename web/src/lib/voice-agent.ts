@@ -21,9 +21,11 @@
 import {
   agentSearch,
   agentWrapUp,
+  appendTranscriptTurn,
   type FitScore,
   type WrapUpInput,
 } from "./api";
+import { startMixedRecording, type CallRecorderHandle } from "./recorder";
 
 const AGENT_WS_URL = "wss://agent.deepgram.com/v1/agent/converse";
 
@@ -52,9 +54,15 @@ export interface VoiceAgentCallbacks {
   /** Fired after wrap_up completes; the UI uses this to start the
    *  recording upload + transition to the downloads screen. */
   onWrapUp: (wrapUp: WrapUpInput) => void;
-  /** Fired when an audio MediaStream is available for the waveform +
-   *  the MediaRecorder mixer. Called once per session. */
+  /** Fired when an audio MediaStream is available for the waveform.
+   *  Called once per session. */
   onAgentStream: (stream: MediaStream | null) => void;
+  /** Fired when the watchdog determines the agent has gone silent
+   *  without calling wrap_up itself. The page should run its wrap-up
+   *  path (post a synthetic /agent/wrap-up, upload the recording,
+   *  transition to the wrap-up screen). The synthesis layer in the
+   *  worker will still produce a real AI summary from the transcript. */
+  onWatchdogWrapUp: () => void;
 }
 
 export interface VoiceAgentSession {
@@ -62,6 +70,11 @@ export interface VoiceAgentSession {
   stop: () => Promise<void>;
   /** Mic MediaStream for the visitor's side — owned by this session. */
   getMicStream: () => MediaStream | null;
+  /** Stop the recording and return the mixed-audio Blob. The blob
+   *  contains both the visitor's mic and the agent's TTS audio in a
+   *  single track, captured deterministically via AudioContext
+   *  routing (no React state lag). */
+  stopRecording: () => Promise<Blob>;
 }
 
 // === Public API ============================================================
@@ -80,9 +93,48 @@ export function createVoiceAgentSession(opts: {
   let agentMediaSource: MediaSource | null = null;
   let agentSourceBuffer: SourceBuffer | null = null;
   const agentMp3Queue: ArrayBuffer[] = [];
-  let agentStreamCaptured: MediaStream | null = null;
+  // Web Audio routing for the agent's TTS — feeds both speakers and
+  // a MediaStreamDestination (which the recorder taps).
+  let agentSourceNode: MediaElementAudioSourceNode | null = null;
+  let recorder: CallRecorderHandle | null = null;
   let keepAliveInterval: ReturnType<typeof setInterval> | null = null;
   let stopped = false;
+  // Wall-clock at call start, used to compute ts_offset_ms when persisting
+  // transcript turns.
+  const sessionStartMs = Date.now();
+
+  // Watchdog: if AgentAudioDone fires and neither the user starts speaking
+  // nor a wrap_up FunctionCallRequest arrives within WATCHDOG_MS, we
+  // assume the agent has wrapped up verbally but forgotten to call the
+  // wrap_up function. Fire the page's wrap-up path ourselves.
+  const WATCHDOG_MS = 15_000;
+  let watchdogTimer: ReturnType<typeof setTimeout> | null = null;
+  let wrapUpInFlight = false;
+  let watchdogFired = false;
+
+  function armWatchdog(): void {
+    if (wrapUpInFlight || watchdogFired || stopped) return;
+    clearWatchdog();
+    watchdogTimer = setTimeout(() => {
+      if (wrapUpInFlight || watchdogFired || stopped) return;
+      watchdogFired = true;
+      console.warn(
+        "[voice-agent] watchdog firing — agent went silent without calling wrap_up",
+      );
+      try {
+        callbacks.onWatchdogWrapUp();
+      } catch (e) {
+        console.error("[voice-agent] watchdog handler failed", e);
+      }
+    }, WATCHDOG_MS);
+  }
+
+  function clearWatchdog(): void {
+    if (watchdogTimer !== null) {
+      clearTimeout(watchdogTimer);
+      watchdogTimer = null;
+    }
+  }
 
   const { callbacks } = opts;
 
@@ -98,21 +150,48 @@ export function createVoiceAgentSession(opts: {
       },
     });
 
-    // Deepgram wants linear16 PCM 16kHz. We resample using a
-    // ScriptProcessorNode for compatibility — AudioWorklet would be
-    // cleaner but adds module-loading complexity for marginal latency
-    // savings on a 90-second demo.
-    // 4096-sample buffer at 16kHz ≈ 256ms per frame.
-    micContext = new AudioContext({ sampleRate: 16000 });
+    // Permission granted — flip the UI off "REQUESTING MICROPHONE" and
+    // onto "CONNECTING" as soon as we have the stream, even though the
+    // AudioContext still needs a moment to spin up.
+    callbacks.onState("connecting");
+
+    // Use the system's native sample rate (typically 48kHz on Windows/Mac,
+    // 44.1kHz on iOS). Forcing 16kHz here triggers Chrome's audio driver
+    // resampler init which adds 500-2000ms of "REQUESTING MICROPHONE"
+    // hang time. We resample ourselves down to 16kHz inside the
+    // ScriptProcessor — that's cheap and runs in real time.
+    micContext = new AudioContext();
+    const inputSampleRate = micContext.sampleRate;
+    const targetSampleRate = 16000;
+    const resampleRatio = targetSampleRate / inputSampleRate; // e.g. 16000/48000 = 1/3
+
     const source = micContext.createMediaStreamSource(micStream);
+    // 4096-sample buffer at 48kHz ≈ 85ms; produces ~1365 16kHz samples.
     const processor = micContext.createScriptProcessor(4096, 1, 1);
     micProcessor = processor;
 
     processor.onaudioprocess = (e) => {
       if (!ws || ws.readyState !== WebSocket.OPEN) return;
       const input = e.inputBuffer.getChannelData(0);
-      const pcm16 = floatTo16BitPCM(input);
-      ws.send(pcm16);
+      // Downsample to 16kHz via simple decimation with averaging.
+      // For voice this is indistinguishable from a proper polyphase
+      // filter and avoids the cost of one. Chrome's input audio is
+      // already low-passed by the AGC/noise-suppression chain above.
+      const outLen = Math.floor(input.length * resampleRatio);
+      const out = new Int16Array(outLen);
+      const step = 1 / resampleRatio;
+      let inPos = 0;
+      for (let i = 0; i < outLen; i++) {
+        const idx = inPos | 0;
+        const frac = inPos - idx;
+        const a = input[idx] ?? 0;
+        const b = input[idx + 1] ?? a;
+        const sample = a + (b - a) * frac;
+        const clamped = Math.max(-1, Math.min(1, sample));
+        out[i] = clamped < 0 ? clamped * 0x8000 : clamped * 0x7fff;
+        inPos += step;
+      }
+      ws.send(out.buffer);
     };
 
     source.connect(processor);
@@ -122,23 +201,30 @@ export function createVoiceAgentSession(opts: {
   // ---- Agent audio playback ----------------------------------------------
 
   function setupAgentAudio(): void {
-    // We use MediaSource to stream mp3 chunks to an <audio> element.
-    // captureStream() on that element gives us a MediaStream the
-    // recorder + waveform can tap into.
+    if (!micContext) {
+      callbacks.onError("Audio context not initialized");
+      return;
+    }
+    if (!micStream) {
+      callbacks.onError("Mic stream not initialized");
+      return;
+    }
+    if (typeof MediaSource === "undefined") {
+      callbacks.onError("MediaSource is not supported in this browser");
+      return;
+    }
+
+    // Stream agent mp3 chunks into a hidden <audio> via MediaSource.
     agentAudioEl = document.createElement("audio");
     agentAudioEl.autoplay = true;
     // playsinline is only typed on HTMLVideoElement, but iOS Safari respects
     // the attribute on <audio> too and refuses inline playback without it.
     agentAudioEl.setAttribute("playsinline", "");
-    // Hidden but present in the DOM (Safari needs the element attached
-    // to the document for some media operations).
     agentAudioEl.style.display = "none";
+    // Critical: muted=false is the default; we want the user to hear the
+    // agent through the <audio> element directly. But ALSO route through
+    // Web Audio for recording — see below.
     document.body.appendChild(agentAudioEl);
-
-    if (typeof MediaSource === "undefined") {
-      callbacks.onError("MediaSource is not supported in this browser");
-      return;
-    }
 
     agentMediaSource = new MediaSource();
     agentAudioEl.src = URL.createObjectURL(agentMediaSource);
@@ -154,21 +240,50 @@ export function createVoiceAgentSession(opts: {
       }
     });
 
-    // Capture the playback as a MediaStream for the waveform/recorder.
-    // Safari's captureStream is gated behind a flag; we degrade gracefully.
-    const captureFn =
-      (agentAudioEl as HTMLMediaElement & { captureStream?: () => MediaStream })
-        .captureStream;
-    if (typeof captureFn === "function") {
-      try {
-        agentStreamCaptured = captureFn.call(agentAudioEl);
-        callbacks.onAgentStream(agentStreamCaptured);
-      } catch (e) {
-        console.warn("[voice-agent] captureStream failed", e);
-        callbacks.onAgentStream(null);
-      }
-    } else {
-      callbacks.onAgentStream(null);
+    // Proper agent-audio capture: route through Web Audio so we have a
+    // guaranteed MediaStream from the moment setup completes — no
+    // dependence on captureStream() (which silently produces a
+    // track-less stream until playback starts in some browsers).
+    //
+    // Architecture:
+    //   <audio> element ──┐
+    //                     └─→ createMediaElementSource ──┬─→ destination (speakers)
+    //                                                    └─→ MediaStreamDestination
+    //                                                          .stream (→ recorder)
+    //
+    // Both the mic and the agent stream land in the same recorder via
+    // its internal MediaStreamDestination mixer. The recorder is
+    // started here so it has both streams from t=0.
+
+    try {
+      agentSourceNode = micContext.createMediaElementSource(agentAudioEl);
+    } catch (e) {
+      console.error("[voice-agent] createMediaElementSource failed", e);
+      callbacks.onError("Could not route the agent's audio for recording");
+      return;
+    }
+
+    // Connect to speakers so the user hears the agent.
+    agentSourceNode.connect(micContext.destination);
+
+    // Tap the same node for the recorder via a MediaStreamDestination.
+    const agentDest = micContext.createMediaStreamDestination();
+    agentSourceNode.connect(agentDest);
+    const agentStreamForRecorder = agentDest.stream;
+
+    // Expose for the waveform / orb energy.
+    callbacks.onAgentStream(agentStreamForRecorder);
+
+    // Start the recorder NOW with both streams wired up.
+    try {
+      recorder = startMixedRecording({
+        audioContext: micContext,
+        micStream: micStream!,
+        agentStream: agentStreamForRecorder,
+      });
+    } catch (e) {
+      console.warn("[voice-agent] recorder failed to start; call audio won't be captured", e);
+      recorder = null;
     }
   }
 
@@ -258,16 +373,25 @@ export function createVoiceAgentSession(opts: {
         callbacks.onState("listening");
         break;
       case "UserStartedSpeaking":
+        // Real conversation in progress — kill any pending watchdog.
+        clearWatchdog();
         callbacks.onState("listening");
         break;
       case "AgentThinking":
+        // Agent is mid-thought; not silent.
+        clearWatchdog();
         callbacks.onState("thinking");
         break;
       case "AgentStartedSpeaking":
+        clearWatchdog();
         callbacks.onState("speaking");
         break;
       case "AgentAudioDone":
+        // Agent finished a turn. If the user doesn't respond and the
+        // agent doesn't issue wrap_up within WATCHDOG_MS, we'll
+        // assume it's done and force the wrap-up path.
         callbacks.onState("listening");
+        armWatchdog();
         break;
       case "ConversationText":
         handleConversationText(msg);
@@ -297,6 +421,13 @@ export function createVoiceAgentSession(opts: {
       role,
       content,
     });
+    // Persist to DB so the PDF worker has the canonical transcript.
+    // Fire-and-forget — failures don't break the call.
+    void appendTranscriptTurn(opts.callSessionToken, {
+      role,
+      content,
+      tsOffsetMs: Date.now() - sessionStartMs,
+    });
   }
 
   // ---- Function call routing --------------------------------------------
@@ -320,6 +451,9 @@ export function createVoiceAgentSession(opts: {
 
       try {
         if (fn.name === "search_background") {
+          // Agent is mid-thought; not silent. Kill the watchdog so we
+          // don't fire while a search is in flight.
+          clearWatchdog();
           callbacks.onState("searching");
           const query = typeof argsObj.query === "string" ? argsObj.query : "";
           const topK = typeof argsObj.top_k === "number" ? argsObj.top_k : 3;
@@ -330,6 +464,9 @@ export function createVoiceAgentSession(opts: {
           });
           result = await agentSearch(opts.callSessionToken, query, topK);
         } else if (fn.name === "wrap_up") {
+          // Real wrap-up is firing — disable the watchdog entirely.
+          wrapUpInFlight = true;
+          clearWatchdog();
           callbacks.onState("wrapping-up");
           const wrap: WrapUpInput = {
             visitor_name: stringField(argsObj, "visitor_name"),
@@ -383,6 +520,7 @@ export function createVoiceAgentSession(opts: {
 
   async function stop(): Promise<void> {
     stopped = true;
+    clearWatchdog();
     cleanupKeepAlive();
     if (ws) {
       try {
@@ -392,6 +530,8 @@ export function createVoiceAgentSession(opts: {
       }
       ws = null;
     }
+    // Stop the mic ScriptProcessor so we don't keep sending PCM frames
+    // to a closed socket.
     if (micProcessor) {
       try {
         micProcessor.disconnect();
@@ -400,17 +540,22 @@ export function createVoiceAgentSession(opts: {
       }
       micProcessor = null;
     }
-    if (micContext) {
+    // Note: we do NOT close micContext here. The recorder is still
+    // running off the same AudioContext, and closing it would drop the
+    // tail of the recording. The caller is responsible for calling
+    // stopRecording() BEFORE stop(), or accepting that the final blob
+    // may be missing the last few hundred ms.
+    if (agentSourceNode) {
       try {
-        await micContext.close();
+        agentSourceNode.disconnect();
       } catch {
         /* ignore */
       }
-      micContext = null;
+      agentSourceNode = null;
     }
     if (micStream) {
       micStream.getTracks().forEach((t) => t.stop());
-      // Don't null micStream — the recorder may still need it for stop()
+      // Don't null micStream — the recorder may still need it.
     }
     if (agentAudioEl) {
       try {
@@ -420,6 +565,17 @@ export function createVoiceAgentSession(opts: {
         /* ignore */
       }
       agentAudioEl = null;
+    }
+    // Close AudioContext last, after the recorder has had a chance to
+    // finalize. If the caller already invoked stopRecording(), this is
+    // safe; if not, the AudioContext will be GC'd eventually.
+    if (micContext) {
+      try {
+        await micContext.close();
+      } catch {
+        /* ignore */
+      }
+      micContext = null;
     }
     callbacks.onState("ended");
   }
@@ -435,20 +591,21 @@ export function createVoiceAgentSession(opts: {
     return micStream;
   }
 
-  return { start, stop, getMicStream };
+  async function stopRecording(): Promise<Blob> {
+    if (!recorder) {
+      // Return an empty blob with the recorder's preferred mime; caller
+      // can detect zero-size and skip the upload.
+      return new Blob([], { type: "audio/webm" });
+    }
+    const blob = await recorder.stop();
+    recorder = null;
+    return blob;
+  }
+
+  return { start, stop, getMicStream, stopRecording };
 }
 
 // === Helpers ===============================================================
-
-function floatTo16BitPCM(input: Float32Array): ArrayBuffer {
-  const buffer = new ArrayBuffer(input.length * 2);
-  const view = new DataView(buffer);
-  for (let i = 0; i < input.length; i++) {
-    const s = Math.max(-1, Math.min(1, input[i]));
-    view.setInt16(i * 2, s < 0 ? s * 0x8000 : s * 0x7fff, true);
-  }
-  return buffer;
-}
 
 function stringField(obj: Record<string, unknown>, key: string): string {
   const v = obj[key];

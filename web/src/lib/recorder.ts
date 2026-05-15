@@ -1,20 +1,20 @@
 /**
- * MediaRecorder that captures BOTH the visitor's mic and the agent's TTS
- * output into a single mixed audio file.
+ * Mixed-audio call recorder.
  *
- * Approach (per design.md "Risks" #4):
- *  1. Create an AudioContext and a MediaStreamAudioDestinationNode.
- *  2. Route the mic MediaStream through a MediaStreamAudioSourceNode → dest.
- *  3. Route the agent MediaStream the same way → dest.
- *  4. MediaRecorder against dest.stream captures the mixed audio.
+ * Designed to be driven by voice-agent.ts: the session owns the AudioContext
+ * (the same one it uses to play the agent's TTS), and hands both the mic
+ * stream and a synthetic agent stream (a MediaStreamDestination tap of the
+ * agent's playback graph) to startMixedRecording().
+ *
+ * This eliminates the React-state-lag bug where the recorder used to be
+ * constructed before the agent stream existed. With the AudioContext-based
+ * approach, both inputs are wired into the recorder's mixer at t=0.
  *
  * Output format depends on the browser:
  *   Chrome/Edge → audio/webm;codecs=opus
  *   Firefox     → audio/webm;codecs=opus
  *   Safari      → audio/mp4
- *
- * We don't transcode — let the browser produce whatever it can, server
- * stores as-is, downloads with the right Content-Type.
+ * We don't transcode — the server stores as-is.
  */
 
 const PREFERRED_MIME_TYPES = [
@@ -33,76 +33,86 @@ function pickMimeType(): string | undefined {
 }
 
 export interface CallRecorderHandle {
-  /** Stop the recording and return the final Blob. */
+  /** Stop the recording and return the final mixed Blob. */
   stop: () => Promise<Blob>;
   /** Stop without waiting for chunks; for error paths. */
   abort: () => void;
 }
 
-/**
- * Start a mixed recording. Returns a handle that yields the final Blob
- * when stopped.
- *
- * Caller is responsible for:
- *  - Asking permission for the mic via getUserMedia (the mic stream is
- *    passed in here, not requested).
- *  - Providing a MediaStream for the agent's TTS audio (typically derived
- *    from an <audio> element via captureStream() or directly from the
- *    Deepgram SDK).
- *  - Not closing either stream until stop() resolves.
- */
-export function startCallRecording(opts: {
+export interface StartMixedRecordingOptions {
+  /** Shared AudioContext — owned by the voice-agent session. The recorder
+   *  attaches its mixer node to this context but does NOT close it on stop;
+   *  the session is responsible for context lifecycle. */
+  audioContext: AudioContext;
+  /** Visitor's mic stream (from getUserMedia). */
   micStream: MediaStream;
-  agentStream: MediaStream | null;
-}): CallRecorderHandle {
-  const audioContext = new AudioContext();
+  /** Agent TTS stream (from a MediaStreamAudioDestinationNode tap of
+   *  the agent's playback graph in the same AudioContext). */
+  agentStream: MediaStream;
+}
+
+/**
+ * Start a mixed recording.
+ *
+ * Mixing approach: build a single MediaStreamAudioDestinationNode inside
+ * the supplied AudioContext, connect both input streams (mic + agent) to
+ * it, run a MediaRecorder over dest.stream. Browser produces one
+ * audio track with both voices.
+ */
+export function startMixedRecording(
+  opts: StartMixedRecordingOptions,
+): CallRecorderHandle {
+  const { audioContext } = opts;
   const destination = audioContext.createMediaStreamDestination();
 
+  if (opts.micStream.getAudioTracks().length === 0) {
+    throw new Error("mic stream has no audio tracks");
+  }
   const micSource = audioContext.createMediaStreamSource(opts.micStream);
   micSource.connect(destination);
 
-  if (opts.agentStream && opts.agentStream.getAudioTracks().length > 0) {
+  if (opts.agentStream.getAudioTracks().length === 0) {
+    // This used to be the bug: the agent stream came in track-less because
+    // captureStream() on the <audio> tag wasn't producing tracks before
+    // playback started. With the AudioContext-routed approach (the agent
+    // is sourced from createMediaElementSource → MediaStreamDestination)
+    // the track exists from t=0. If we still hit this branch something is
+    // wrong upstream — log loudly and continue with mic-only.
+    console.warn(
+      "[recorder] agent stream has no tracks — recording mic only. This is a bug.",
+    );
+  } else {
     const agentSource = audioContext.createMediaStreamSource(opts.agentStream);
     agentSource.connect(destination);
-  } else {
-    // If we don't have the agent stream (e.g. SDK doesn't expose it), the
-    // recording is just the visitor's side. Still useful, just lossy of
-    // half the conversation.
-    console.warn("[recorder] no agent stream supplied — recording mic only");
   }
 
   const mimeType = pickMimeType();
-  const recorder = new MediaRecorder(
+  const mr = new MediaRecorder(
     destination.stream,
     mimeType ? { mimeType } : undefined,
   );
 
   const chunks: Blob[] = [];
-  recorder.ondataavailable = (e) => {
+  mr.ondataavailable = (e) => {
     if (e.data && e.data.size > 0) chunks.push(e.data);
   };
 
-  recorder.start(1000); // emit a chunk every 1s — bounds memory on long calls
+  // Emit a chunk every 1s — bounds memory and means we have something to
+  // upload even on hard disconnect.
+  mr.start(1000);
 
   let stopPromise: Promise<Blob> | null = null;
   const stop = (): Promise<Blob> => {
     if (stopPromise) return stopPromise;
     stopPromise = new Promise<Blob>((resolve) => {
-      recorder.onstop = () => {
-        const blob = new Blob(chunks, {
-          type: mimeType ?? "audio/webm",
-        });
-        try {
-          audioContext.close();
-        } catch {
-          /* already closed */
-        }
+      mr.onstop = () => {
+        const blob = new Blob(chunks, { type: mimeType ?? "audio/webm" });
         resolve(blob);
       };
       try {
-        recorder.stop();
+        if (mr.state !== "inactive") mr.stop();
+        else resolve(new Blob(chunks, { type: mimeType ?? "audio/webm" }));
       } catch {
-        // already stopped
         resolve(new Blob(chunks, { type: mimeType ?? "audio/webm" }));
       }
     });
@@ -111,12 +121,7 @@ export function startCallRecording(opts: {
 
   const abort = (): void => {
     try {
-      recorder.stop();
-    } catch {
-      /* ignore */
-    }
-    try {
-      audioContext.close();
+      if (mr.state !== "inactive") mr.stop();
     } catch {
       /* ignore */
     }
@@ -126,24 +131,20 @@ export function startCallRecording(opts: {
 }
 
 /**
- * Wrap an HTMLAudioElement so its playback is also captured by an
- * AudioContext destination. Used when the Deepgram SDK plays agent
- * audio via an <audio> tag and we need the same audio to feed both
- * the speakers AND our waveform/recording graph.
+ * @deprecated Kept only for source compatibility during refactor.
+ * Use startMixedRecording instead — voice-agent.ts owns the recorder now.
  */
-export function captureStreamFromAudioElement(el: HTMLAudioElement): MediaStream | null {
-  // captureStream is non-standard but widely supported in modern browsers.
-  // Safari may need experimental flags; if missing, we skip TTS recording.
-  const captureFn =
-    (el as HTMLMediaElement & { captureStream?: () => MediaStream }).captureStream;
-  if (typeof captureFn !== "function") {
-    console.warn("[recorder] HTMLAudioElement.captureStream not supported here");
-    return null;
-  }
-  try {
-    return captureFn.call(el);
-  } catch (e) {
-    console.warn("[recorder] captureStream() failed", e);
-    return null;
-  }
+export function startCallRecording(_opts: unknown): CallRecorderHandle {
+  throw new Error(
+    "startCallRecording is deprecated; the voice-agent session owns the recorder now.",
+  );
+}
+
+/**
+ * @deprecated unused — kept so existing imports don't break.
+ */
+export function captureStreamFromAudioElement(
+  _el: HTMLAudioElement,
+): MediaStream | null {
+  return null;
 }

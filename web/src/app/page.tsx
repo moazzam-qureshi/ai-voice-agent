@@ -16,20 +16,16 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { Header } from "@/components/Header";
+import { Orb, type OrbState } from "@/components/Orb";
 import { Transcript } from "@/components/Transcript";
-import { Waveform } from "@/components/Waveform";
 import {
+  agentWrapUp,
   ApiError,
   getCallStatus,
   startCall,
   uploadRecording,
   type CallStatus,
 } from "@/lib/api";
-import {
-  captureStreamFromAudioElement as _captureFromEl, // re-export-only to keep tree-shaking honest
-  startCallRecording,
-  type CallRecorderHandle,
-} from "@/lib/recorder";
 import { getTurnstileToken } from "@/lib/turnstile";
 import {
   createVoiceAgentSession,
@@ -38,11 +34,7 @@ import {
   type VoiceState,
 } from "@/lib/voice-agent";
 
-// _captureFromEl is exported for future use (e.g. fallback when the SDK
-// doesn't expose an agent MediaStream directly).
-void _captureFromEl;
-
-const MAX_SECONDS = 90;
+const MAX_SECONDS = 180;
 
 type Screen = "idle" | "permission" | "in-call" | "wrap-up" | "downloads" | "error";
 
@@ -59,10 +51,19 @@ export default function HomePage() {
   const [callStatus, setCallStatus] = useState<CallStatus | null>(null);
 
   const sessionRef = useRef<VoiceAgentSession | null>(null);
-  const recorderRef = useRef<CallRecorderHandle | null>(null);
   const startInstantRef = useRef<number>(0);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  // Hold the per-call session token + call_id so the time-cap path can
+  // still POST /agent/wrap-up and /calls/{id}/recording even when the
+  // agent itself didn't invoke wrap_up before the cap fired.
+  const callSessionTokenRef = useRef<string | null>(null);
+  const callIdRef = useRef<string | null>(null);
   const wrapInProgressRef = useRef<boolean>(false);
+  // Forward-reference: the watchdog handler (declared inside
+  // onStartConversation's callbacks) needs to call onForceEnd, but
+  // onForceEnd is declared later. We install it into this ref once
+  // it's defined, and the callback dereferences at firing time.
+  const onForceEndRef = useRef<() => Promise<void>>(async () => {});
 
   // ----- Effect: tick the call timer ---------------------------------------
   useEffect(() => {
@@ -151,6 +152,8 @@ export default function HomePage() {
     }
 
     setCallId(callResp.call_id);
+    callIdRef.current = callResp.call_id;
+    callSessionTokenRef.current = callResp.call_session_token;
 
     const session = createVoiceAgentSession({
       deepgramToken: callResp.deepgram_token,
@@ -169,6 +172,14 @@ export default function HomePage() {
           void finishCall(callResp.call_id, callResp.call_session_token, "agent-wrap-up");
         },
         onAgentStream: (stream) => setAgentStream(stream),
+        onWatchdogWrapUp: () => {
+          // Agent went silent without calling wrap_up. Run the same
+          // forced-end path the time cap uses — the worker's LLM
+          // synthesis layer will still produce a real summary from
+          // the persisted transcript.
+          console.warn("[page] watchdog wrap-up triggered");
+          void onForceEndRef.current();
+        },
       },
     });
     sessionRef.current = session;
@@ -182,19 +193,13 @@ export default function HomePage() {
     }
 
     // Mic stream is now owned by session; pull it for the recorder.
-    const mic = session.getMicStream();
-    if (mic) {
-      // We'll receive agentStream a tick later via onAgentStream; the
-      // recorder accepts null and degrades to mic-only if needed.
-      const recorder = startCallRecording({
-        micStream: mic,
-        agentStream: agentStream, // may be null at this moment; mixer will only have mic
-      });
-      recorderRef.current = recorder;
-    }
+    // Note: the recorder is now started inside the voice-agent session
+    // itself (see voice-agent.ts setupAgentAudio). This guarantees both
+    // mic and agent audio streams are wired into the mixer at t=0,
+    // eliminating the prior React-state-lag bug.
 
     setScreen("in-call");
-  }, [agentStream]);
+  }, []);
 
   /** Stop the call from our side (timeout or agent's wrap_up) and run
    *  recording upload + transition to wrap-up screen. */
@@ -204,26 +209,28 @@ export default function HomePage() {
       wrapInProgressRef.current = true;
       setScreen("wrap-up");
 
-      // Stop the voice agent session (closes WS, stops mic).
       const session = sessionRef.current;
       sessionRef.current = null;
-      if (session) {
-        try {
-          await session.stop();
-        } catch {
-          /* ignore */
-        }
+      if (!session) return;
+
+      // Order matters: stop the recorder FIRST (which finalizes the blob
+      // while the AudioContext is still alive), then stop the session
+      // (which closes WS, stops mic, closes AudioContext).
+      let blob: Blob | null = null;
+      try {
+        blob = await session.stopRecording();
+      } catch (e) {
+        console.error("[page] stopRecording failed", e);
+      }
+      try {
+        await session.stop();
+      } catch {
+        /* ignore */
       }
 
-      // Stop the recorder and upload the blob.
-      const recorder = recorderRef.current;
-      recorderRef.current = null;
-      if (recorder) {
+      if (blob && blob.size > 0) {
         try {
-          const blob = await recorder.stop();
-          if (blob.size > 0) {
-            await uploadRecording(cId, callSessionToken, blob);
-          }
+          await uploadRecording(cId, callSessionToken, blob);
         } catch (e) {
           console.error("[page] recording upload failed", e);
           // Non-fatal: the wrap-up screen still polls /calls/{id};
@@ -235,31 +242,51 @@ export default function HomePage() {
   );
 
   const onForceEnd = useCallback(async () => {
-    if (!callId) return;
-    const session = sessionRef.current;
-    if (!session) return;
-    // We don't have a per-call session token in scope here; only
-    // finishCall(...) does the upload. Pull the token from a ref... we
-    // don't have one. So this path requires the agent's wrap_up to
-    // have run, OR the user explicitly ends and we just stop locally
-    // without uploading. For v1, time-cap ends the session and goes
-    // to wrap-up; the recording is best-effort.
-    setScreen("wrap-up");
+    const cId = callIdRef.current;
+    const token = callSessionTokenRef.current;
+    if (!cId || !token) return;
+    if (wrapInProgressRef.current) return;
+
+    // Build a wrap-up payload from the real transcript so the backend
+    // can persist + enqueue PDF generation. The agent itself never
+    // called wrap_up (time cap fired first), so we don't have its
+    // structured fit assessment — but we do have everything the
+    // visitor actually said. The PDF makes it clear the call was
+    // truncated; the recording covers the rest.
+    const visitorTurns = transcript
+      .filter((t) => t.role === "visitor" && t.content.trim().length > 0)
+      .map((t) => t.content.trim());
+    const projectBrief =
+      visitorTurns.length > 0
+        ? visitorTurns.join(" ")
+        : "(No visitor speech captured before the time cap.)";
+
     try {
-      await session.stop();
-    } catch {
-      /* ignore */
+      await agentWrapUp(token, {
+        visitor_name: "Caller",
+        project_brief: projectBrief.slice(0, 1800),
+        fit_score: "partial",
+        fit_reasoning:
+          "The 3-minute time cap was reached before the agent could give a fit " +
+          "assessment. The full conversation is captured in the recording.",
+        action_items: [
+          "Review the recording for project details",
+          "Reach out via email to continue the conversation",
+        ],
+      });
+    } catch (e) {
+      console.error("[page] time-cap wrap-up failed", e);
+      // Continue to finishCall anyway — recording upload may still succeed.
     }
-    sessionRef.current = null;
-    if (recorderRef.current) {
-      try {
-        await recorderRef.current.stop();
-      } catch {
-        /* ignore */
-      }
-      recorderRef.current = null;
-    }
-  }, [callId]);
+
+    await finishCall(cId, token, "time-cap");
+  }, [finishCall, transcript]);
+
+  // Make onForceEnd available to the watchdog callback in voice-agent.ts,
+  // which is created inside onStartConversation BEFORE onForceEnd has
+  // been declared. We install the latest reference on each render; the
+  // watchdog dereferences this ref at firing time.
+  onForceEndRef.current = onForceEnd;
 
   const onEndCallClick = useCallback(() => {
     void onForceEnd();
@@ -282,9 +309,9 @@ export default function HomePage() {
   return (
     <div className="min-h-screen flex flex-col">
       <Header />
-      <main className="flex-1 max-w-[720px] w-full mx-auto px-6 py-12">
+      <main className="flex-1 max-w-[920px] w-full mx-auto px-6 py-8 md:py-12">
         {screen === "idle" && <IdleScreen onStart={onStartConversation} />}
-        {screen === "permission" && <PermissionScreen />}
+        {screen === "permission" && <PermissionScreen voiceState={voiceState} />}
         {screen === "in-call" && (
           <InCallScreen
             voiceState={voiceState}
@@ -319,48 +346,160 @@ export default function HomePage() {
 
 function IdleScreen({ onStart }: { onStart: () => void }) {
   return (
-    <div className="flex flex-col items-center text-center pt-16">
-      <div className="mono-label mono-label--accent mb-8">▶ READY</div>
-
-      <h1 className="display-lg mb-6">Talk to my AI assistant.</h1>
-      <p
-        className="body-lg max-w-[520px] mb-12"
-        style={{ color: "var(--color-fg-muted)" }}
-      >
-        It knows what I&apos;ve built, what I can do, and whether I&apos;m a fit
-        for your project.
-      </p>
-
-      <button className="btn-primary" onClick={onStart}>
-        <span className="inline-block w-2 h-2 rounded-full bg-current mr-3 align-middle" />
-        Start conversation
-      </button>
-
-      <p className="caption mt-6" style={{ color: "var(--color-fg-faint)" }}>
-        90 second cap · 2 calls per day
-      </p>
-
-      <div className="divider mt-16 w-full max-w-[480px]">
-        <div className="divider__line" />
-        <div className="divider__label">How this works</div>
-        <div className="divider__line" />
+    <div className="flex flex-col items-center text-center">
+      {/* Tagline */}
+      <div className="status-indicator mb-10 mt-4">
+        <span className="status-indicator__dot" style={{ background: "var(--color-accent)" }} />
+        Production AI voice agent · RAG · Deepgram · FastAPI
       </div>
 
-      <ol className="w-full max-w-[480px] space-y-3 text-left mt-4">
+      {/* Hero orb */}
+      <div className="mb-10">
+        <Orb state="idle" size={220} />
+      </div>
+
+      {/* Headline + sub */}
+      <h1 className="hero-display mb-6">
+        Customer Support Voice Agent
+      </h1>
+      <p className="hero-sub mb-12">
+        A live, RAG-grounded voice agent that qualifies inbound leads,
+        answers product questions, and hands off a clean summary to the
+        team. Right now it&apos;s deployed as my own intake agent —
+        try it, then hire me to build one for your business.
+      </p>
+
+      {/* CTA */}
+      <button className="btn-primary" onClick={onStart}>
+        <span
+          className="inline-block w-2 h-2 rounded-full mr-3 align-middle"
+          style={{ background: "var(--color-bg-base)" }}
+        />
+        Talk to the agent
+      </button>
+      <p className="caption mt-5" style={{ color: "var(--color-fg-faint)" }}>
+        Real-time RAG · 3-minute demo cap · PDF + audio recording delivered
+      </p>
+
+      {/* How it works — 4 stat cards reframed as capability statements */}
+      <div className="mt-20 grid grid-cols-2 md:grid-cols-4 gap-3 w-full max-w-[820px]">
         {[
-          "Click start, give mic permission",
-          "Tell the agent about your project",
-          "It searches my portfolio for relevant work",
-          "You leave with a PDF summary and the recording",
-        ].map((step, i) => (
-          <li key={i} className="flex gap-4">
-            <span className="caption" style={{ color: "var(--color-accent-deep)" }}>
-              {String(i + 1).padStart(2, "0")}
-            </span>
-            <span style={{ color: "var(--color-fg)" }}>{step}</span>
-          </li>
+          {
+            n: "01",
+            t: "Sub-second voice",
+            s: "Deepgram Aura-2 TTS + Flux STT over WebSocket. Real conversational latency, not chatbot-with-mic.",
+          },
+          {
+            n: "02",
+            t: "Custom knowledge base",
+            s: "Hybrid BM25 + kNN over indexed business docs. Agent quotes real content, no hallucinated promises.",
+          },
+          {
+            n: "03",
+            t: "Structured handoff",
+            s: "Tool-calling captures qualified-lead fields. LLM synthesizes the PDF from the full transcript.",
+          },
+          {
+            n: "04",
+            t: "Production guardrails",
+            s: "Turnstile gate, per-IP rate limits, cost ceiling, 24h auto-delete. Coolify-deployed.",
+          },
+        ].map((step) => (
+          <div
+            key={step.n}
+            className="panel"
+            style={{ padding: "20px 18px", textAlign: "left" }}
+          >
+            <div
+              className="font-mono mb-3"
+              style={{
+                fontSize: "11px",
+                letterSpacing: "0.08em",
+                color: "var(--color-accent)",
+              }}
+            >
+              {step.n}
+            </div>
+            <div
+              className="mb-1"
+              style={{
+                font: "500 14px var(--font-sans)",
+                color: "var(--color-fg)",
+              }}
+            >
+              {step.t}
+            </div>
+            <div
+              style={{
+                font: "400 12px/18px var(--font-sans)",
+                color: "var(--color-fg-muted)",
+              }}
+            >
+              {step.s}
+            </div>
+          </div>
         ))}
-      </ol>
+      </div>
+
+      {/* Hire-me CTA panel */}
+      <div
+        className="panel mt-16 w-full max-w-[820px]"
+        style={{ padding: "32px 36px" }}
+      >
+        <div className="grid md:grid-cols-[1.4fr,1fr] gap-8 items-center text-left">
+          <div>
+            <div
+              className="font-mono mb-3"
+              style={{
+                fontSize: "11px",
+                letterSpacing: "0.1em",
+                textTransform: "uppercase",
+                color: "var(--color-accent)",
+              }}
+            >
+              Want one for your business?
+            </div>
+            <div
+              className="mb-3"
+              style={{
+                font: "500 22px/30px var(--font-sans)",
+                color: "var(--color-fg)",
+                letterSpacing: "-0.01em",
+              }}
+            >
+              I build production voice agents for inbound support, sales
+              qualification, and customer onboarding.
+            </div>
+            <div
+              style={{
+                font: "400 14px/22px var(--font-sans)",
+                color: "var(--color-fg-muted)",
+              }}
+            >
+              Custom RAG over your docs, structured CRM handoff, dashboards,
+              guardrails, deploy to your stack. Two-week prototype, four-week
+              production.
+            </div>
+          </div>
+          <div className="flex flex-col gap-3">
+            <a
+              href="mailto:qureshimoazzam7@gmail.com?subject=Voice%20agent%20build%20—%20from%20VoiceGen"
+              className="btn-primary text-center"
+              style={{ display: "inline-flex", alignItems: "center", justifyContent: "center" }}
+            >
+              Email Moazzam
+            </a>
+            <a
+              href="https://github.com/moazzam-qureshi"
+              target="_blank"
+              rel="noreferrer"
+              className="btn-ghost inline-flex items-center justify-center"
+            >
+              GitHub portfolio
+            </a>
+          </div>
+        </div>
+      </div>
     </div>
   );
 }
@@ -369,12 +508,27 @@ function IdleScreen({ onStart }: { onStart: () => void }) {
 // State 2 — Permission requested
 // ============================================================================
 
-function PermissionScreen() {
+function PermissionScreen({ voiceState }: { voiceState: VoiceState }) {
+  // The "permission" screen is shown for the whole bring-up: getUserMedia,
+  // POST /call/start, session.start(). Once the voice-agent session emits
+  // "connecting" (after getUserMedia returns) we switch the label so the
+  // user knows the slow part isn't mic permission — it's the WS handshake.
+  const connecting = voiceState === "connecting";
+  const label = connecting ? "Connecting" : "Requesting microphone";
+  const sub = connecting
+    ? "Setting up your call with the agent. This usually takes a couple of seconds."
+    : "Allow microphone access to start the call. Your audio never leaves your machine until you speak.";
   return (
-    <div className="flex flex-col items-center text-center pt-32">
-      <div className="mono-label mono-label--accent mb-8">○ REQUESTING MICROPHONE…</div>
-      <p className="body-lg" style={{ color: "var(--color-fg-muted)" }}>
-        Allow microphone access to start the call.
+    <div className="flex flex-col items-center text-center pt-12">
+      <div className="mb-8">
+        <Orb state="thinking" size={160} />
+      </div>
+      <div className="status-indicator status-indicator--thinking mb-6">
+        <span className="status-indicator__dot" />
+        {label}
+      </div>
+      <p className="hero-sub" style={{ fontSize: "16px" }}>
+        {sub}
       </p>
     </div>
   );
@@ -401,6 +555,21 @@ const STATE_LABEL: Record<VoiceState, string> = {
   error: "ERROR",
 };
 
+function voiceStateToOrb(s: VoiceState): OrbState {
+  switch (s) {
+    case "speaking":
+      return "speaking";
+    case "thinking":
+    case "searching":
+    case "wrapping-up":
+      return "thinking";
+    case "listening":
+      return "listening";
+    default:
+      return "idle";
+  }
+}
+
 function InCallScreen(props: {
   voiceState: VoiceState;
   transcript: TranscriptTurn[];
@@ -408,50 +577,84 @@ function InCallScreen(props: {
   agentStream: MediaStream | null;
   onEnd: () => void;
 }) {
-  const timerColor =
-    props.secondsElapsed >= 75
-      ? "var(--color-status-warning)"
-      : "var(--color-fg-muted)";
+  const warning = props.secondsElapsed >= MAX_SECONDS * 0.75;
+  const timerColor = warning
+    ? "var(--color-status-warning)"
+    : "var(--color-fg-muted)";
+  const orbState = voiceStateToOrb(props.voiceState);
+  const stateClass =
+    orbState === "listening"
+      ? "status-indicator--listening"
+      : orbState === "thinking"
+        ? "status-indicator--thinking"
+        : orbState === "speaking"
+          ? "status-indicator--speaking"
+          : "status-indicator--idle";
 
   return (
-    <div className="card mt-8" style={{ borderRadius: "12px" }}>
-      {/* Header strip */}
-      <div className="flex items-center justify-between mb-3">
-        <div className="flex items-center gap-3">
+    <div className="grid grid-cols-1 md:grid-cols-[1fr,1.1fr] gap-6 mt-4">
+      {/* LEFT — Orb console */}
+      <div className="panel flex flex-col items-center" style={{ padding: "36px 32px" }}>
+        {/* Status strip */}
+        <div className="w-full flex items-center justify-between mb-6">
           <span className="pill pill--live">LIVE</span>
-          <span className="caption" style={{ color: timerColor }}>
-            {formatTime(props.secondsElapsed)} / {formatTime(MAX_SECONDS)}
+          <span
+            className="font-mono text-xs tracking-wider"
+            style={{ color: timerColor }}
+          >
+            {formatTime(props.secondsElapsed)} <span style={{ opacity: 0.4 }}>/</span>{" "}
+            {formatTime(MAX_SECONDS)}
           </span>
         </div>
-        <button className="btn-ghost h-8 px-4 text-xs" onClick={props.onEnd}>
+
+        {/* The orb */}
+        <div className="my-6 md:my-10">
+          <Orb
+            state={orbState}
+            audioStream={orbState === "speaking" ? props.agentStream : null}
+            size={240}
+          />
+        </div>
+
+        {/* State indicator */}
+        <div className={`status-indicator ${stateClass} mb-8`}>
+          <span className="status-indicator__dot" />
+          {STATE_LABEL[props.voiceState]}
+        </div>
+
+        {/* End-call button */}
+        <button className="btn-ghost" onClick={props.onEnd}>
           End call
         </button>
       </div>
 
-      <div
-        className="h-px w-full mb-6"
-        style={{ background: "var(--color-border)" }}
-      />
-
-      {/* Waveform */}
-      <div className="mb-4">
-        <Waveform activeStream={props.agentStream} />
+      {/* RIGHT — Transcript panel */}
+      <div className="panel flex flex-col" style={{ minHeight: "520px" }}>
+        <div className="flex items-center justify-between mb-4">
+          <div
+            className="mono-label"
+            style={{ color: "var(--color-fg-muted)" }}
+          >
+            Live transcript
+          </div>
+          <div
+            className="font-mono"
+            style={{
+              fontSize: "10px",
+              color: "var(--color-fg-faint)",
+              letterSpacing: "0.08em",
+            }}
+          >
+            {props.transcript.filter((t) => t.role !== "tool").length} TURNS
+          </div>
+        </div>
+        <div
+          className="flex-1 overflow-y-auto pr-2"
+          style={{ maxHeight: "560px" }}
+        >
+          <Transcript turns={props.transcript} />
+        </div>
       </div>
-
-      <div
-        className="mono-label text-center mb-6"
-        style={{ color: "var(--color-accent)" }}
-      >
-        {STATE_LABEL[props.voiceState]}
-      </div>
-
-      <div className="divider mb-2">
-        <div className="divider__line" />
-        <div className="divider__label">Transcript</div>
-        <div className="divider__line" />
-      </div>
-
-      <Transcript turns={props.transcript} />
     </div>
   );
 }
@@ -462,15 +665,23 @@ function InCallScreen(props: {
 
 function WrapUpScreen() {
   return (
-    <div className="card mt-8 py-16 text-center">
-      <div className="mono-label mono-label--accent mb-8">
-        ● ● ● &nbsp; GENERATING YOUR PDF…
+    <div className="flex flex-col items-center text-center mt-8 py-12">
+      <div className="mb-8">
+        <Orb state="thinking" size={180} />
       </div>
-      <p className="body-lg" style={{ color: "var(--color-fg)" }}>
+      <div className="status-indicator status-indicator--thinking mb-6">
+        <span className="status-indicator__dot" />
+        Generating your deliverables
+      </div>
+      <h1
+        className="hero-display mb-3"
+        style={{ fontSize: "36px", lineHeight: "44px" }}
+      >
         The agent has what it needs.
-      </p>
-      <p className="body-lg mt-2" style={{ color: "var(--color-fg-muted)" }}>
-        Compiling your project summary and preparing your recording.
+      </h1>
+      <p className="hero-sub" style={{ fontSize: "16px" }}>
+        Compiling your project summary and preparing your recording. This
+        usually takes 5-10 seconds.
       </p>
     </div>
   );
@@ -488,45 +699,85 @@ function DownloadsScreen({
   onRestart: () => void;
 }) {
   return (
-    <div className="mt-8">
-      <div className="text-center mb-8">
+    <div className="flex flex-col items-center mt-4">
+      {/* Success orb */}
+      <div className="relative mb-8" style={{ width: 96, height: 96 }}>
         <div
-          className="inline-flex items-center justify-center w-16 h-16 rounded-2xl mb-6"
           style={{
-            background: "rgba(92, 225, 230, 0.12)",
-            boxShadow: "0 0 32px rgba(92, 225, 230, 0.18)",
+            position: "absolute",
+            inset: "-30%",
+            borderRadius: "50%",
+            background:
+              "radial-gradient(closest-side, rgba(92,225,230,0.45), rgba(92,225,230,0) 70%)",
+            filter: "blur(20px)",
+          }}
+        />
+        <div
+          style={{
+            position: "relative",
+            width: "100%",
+            height: "100%",
+            borderRadius: "50%",
+            background:
+              "radial-gradient(circle at 50% 35%, #5CE1E6, #2DB9BE 60%, #0D5C5E)",
+            boxShadow:
+              "inset 0 0 30px rgba(255,255,255,0.15), 0 0 28px rgba(92,225,230,0.4)",
+            display: "grid",
+            placeItems: "center",
+            color: "var(--color-bg-base)",
           }}
         >
-          <span
-            className="text-2xl"
-            style={{ color: "var(--color-accent)" }}
-            aria-hidden
-          >
-            ✓
-          </span>
+          <svg width="42" height="42" viewBox="0 0 24 24" fill="none">
+            <path
+              d="M5 12.5l4.5 4.5L19 7.5"
+              stroke="currentColor"
+              strokeWidth="2.5"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            />
+          </svg>
         </div>
-        <h1 className="display">Conversation complete.</h1>
-        <p
-          className="body-lg mt-3 max-w-[440px] mx-auto"
-          style={{ color: "var(--color-fg-muted)" }}
-        >
-          Two files are ready. Save them now — they&apos;re deleted after 24 hours.
-        </p>
       </div>
 
-      <div className="space-y-4">
+      <div
+        className="font-mono mb-3"
+        style={{
+          fontSize: "11px",
+          letterSpacing: "0.12em",
+          textTransform: "uppercase",
+          color: "var(--color-status-success)",
+        }}
+      >
+        ✓ Conversation complete
+      </div>
+
+      <h1
+        className="hero-display text-center mb-4"
+        style={{ fontSize: "44px", lineHeight: "52px" }}
+      >
+        Your deliverables are ready.
+      </h1>
+      <p
+        className="hero-sub text-center mb-10"
+        style={{ fontSize: "16px" }}
+      >
+        Two files. Save them now — they&apos;re deleted from VoiceGen servers
+        after 24 hours.
+      </p>
+
+      <div className="w-full max-w-[640px] space-y-4">
         <DownloadCard
-          icon="📄"
+          kind="pdf"
           title="Summary"
-          description="Project brief, fit assessment, next steps."
-          meta={status.artifacts.summary_pdf ? "PDF" : "preparing…"}
+          description="Project brief, fit assessment, suggested next steps. Branded PDF."
+          meta={status.artifacts.summary_pdf ? "PDF · ready" : "preparing…"}
           href={status.artifacts.summary_pdf ?? undefined}
         />
         <DownloadCard
-          icon="🎙"
+          kind="audio"
           title="Recording"
-          description="The full audio of our conversation."
-          meta={status.artifacts.recording_mp3 ? "audio" : "preparing…"}
+          description="The full audio of our conversation, mixed visitor + agent."
+          meta={status.artifacts.recording_mp3 ? "Audio · ready" : "preparing…"}
           href={status.artifacts.recording_mp3 ?? undefined}
         />
       </div>
@@ -541,7 +792,7 @@ function DownloadsScreen({
 }
 
 function DownloadCard(props: {
-  icon: string;
+  kind: "pdf" | "audio";
   title: string;
   description: string;
   meta: string;
@@ -549,26 +800,51 @@ function DownloadCard(props: {
 }) {
   const disabled = !props.href;
   return (
-    <div className="card flex items-center gap-4">
-      <div className="text-2xl">{props.icon}</div>
-      <div className="flex-1 min-w-0">
-        <div className="mono-label" style={{ color: "var(--color-fg)" }}>
-          {props.title}
-        </div>
-        <div
-          className="text-sm mt-1"
-          style={{ color: "var(--color-fg-muted)" }}
-        >
-          {props.description}
-        </div>
-        <div className="caption mt-1" style={{ color: "var(--color-fg-faint)" }}>
-          {props.meta}
-        </div>
+    <div className="dl-card">
+      <div className="dl-card__icon">
+        {props.kind === "pdf" ? (
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none">
+            <path
+              d="M6 3h9l5 5v13a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1z"
+              stroke="currentColor"
+              strokeWidth="1.5"
+              strokeLinejoin="round"
+            />
+            <path
+              d="M14 3v6h6"
+              stroke="currentColor"
+              strokeWidth="1.5"
+              strokeLinejoin="round"
+            />
+            <path
+              d="M8 14h8M8 17h5"
+              stroke="currentColor"
+              strokeWidth="1.5"
+              strokeLinecap="round"
+            />
+          </svg>
+        ) : (
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none">
+            <rect x="9" y="3" width="6" height="11" rx="3" stroke="currentColor" strokeWidth="1.5" />
+            <path
+              d="M5 11a7 7 0 0 0 14 0M12 18v3M9 21h6"
+              stroke="currentColor"
+              strokeWidth="1.5"
+              strokeLinecap="round"
+            />
+          </svg>
+        )}
+      </div>
+      <div className="dl-card__body">
+        <div className="dl-card__title">{props.title}</div>
+        <div className="dl-card__desc">{props.description}</div>
+        <div className="dl-card__meta">{props.meta}</div>
       </div>
       <a
         href={props.href}
         download
-        className={`btn-ghost ${disabled ? "pointer-events-none opacity-50" : ""}`}
+        className={`btn-ghost inline-flex items-center justify-center ${disabled ? "pointer-events-none opacity-50" : ""}`}
+        style={{ minWidth: "140px", height: "44px" }}
       >
         Download ↓
       </a>

@@ -297,6 +297,342 @@ body {
 }
 
 /* =========================================================================
+   Orb — the visual centerpiece for in-call state
+   ========================================================================= */
+
+.orb {
+  position: relative;
+  display: grid;
+  place-items: center;
+  --orb-energy: 0;
+}
+
+.orb__halo {
+  position: absolute;
+  inset: -45%;
+  border-radius: 50%;
+  background: radial-gradient(
+    closest-side,
+    rgba(92, 225, 230, 0.45) 0%,
+    rgba(92, 225, 230, 0.12) 35%,
+    rgba(92, 225, 230, 0) 70%
+  );
+  filter: blur(28px);
+  opacity: 0.6;
+  transition: opacity 400ms ease-out;
+  pointer-events: none;
+}
+
+.orb__ring {
+  position: absolute;
+  inset: -8%;
+  border-radius: 50%;
+  background: radial-gradient(
+    closest-side,
+    rgba(92, 225, 230, 0) 60%,
+    rgba(92, 225, 230, 0.18) 75%,
+    rgba(92, 225, 230, 0.45) 88%,
+    rgba(92, 225, 230, 0) 100%
+  );
+  filter: blur(2px);
+  opacity: 0.85;
+  transition: opacity 400ms ease-out, transform 200ms ease-out;
+}
+
+.orb__core {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  border-radius: 50%;
+  background:
+    radial-gradient(circle at 30% 25%, rgba(255, 255, 255, 0.18) 0%, rgba(255, 255, 255, 0) 45%),
+    radial-gradient(
+      circle at 50% 60%,
+      #5CE1E6 0%,
+      #38B5B9 40%,
+      #0D5C5E 75%,
+      #062C2D 100%
+    );
+  box-shadow:
+    inset 0 0 60px rgba(255, 255, 255, 0.08),
+    inset 0 -40px 80px rgba(0, 0, 0, 0.4),
+    0 0 32px rgba(92, 225, 230, 0.35);
+  transform: scale(calc(0.92 + 0.08 * var(--orb-energy)));
+  transition: transform 90ms ease-out, box-shadow 200ms ease-out;
+}
+
+.orb__core-inner {
+  position: absolute;
+  inset: 22%;
+  border-radius: 50%;
+  background: radial-gradient(
+    circle at 50% 35%,
+    rgba(255, 255, 255, 0.4) 0%,
+    rgba(130, 240, 244, 0.25) 25%,
+    rgba(92, 225, 230, 0) 75%
+  );
+  filter: blur(4px);
+  opacity: calc(0.5 + 0.5 * var(--orb-energy));
+  transition: opacity 90ms ease-out;
+}
+
+/* --- State-driven overrides --- */
+
+.orb--idle .orb__core {
+  animation: orb-breathe 4s ease-in-out infinite;
+}
+.orb--idle .orb__halo {
+  animation: orb-halo-breathe 4s ease-in-out infinite;
+}
+
+.orb--listening .orb__core {
+  box-shadow:
+    inset 0 0 60px rgba(255, 255, 255, 0.10),
+    inset 0 -40px 80px rgba(0, 0, 0, 0.4),
+    0 0 calc(40px + 60px * var(--orb-energy)) rgba(92, 225, 230, calc(0.45 + 0.4 * var(--orb-energy)));
+}
+
+.orb--thinking .orb__core {
+  animation: orb-pulse 0.9s ease-in-out infinite;
+}
+.orb--thinking .orb__halo { opacity: 0.4; }
+
+.orb--speaking .orb__core {
+  box-shadow:
+    inset 0 0 80px rgba(255, 255, 255, 0.18),
+    inset 0 -40px 80px rgba(0, 0, 0, 0.35),
+    0 0 calc(50px + 80px * var(--orb-energy)) rgba(130, 240, 244, calc(0.55 + 0.4 * var(--orb-energy)));
+}
+.orb--speaking .orb__core-inner {
+  opacity: calc(0.7 + 0.3 * var(--orb-energy));
+}
+
+.orb__ripple {
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  border: 1.5px solid rgba(92, 225, 230, 0.5);
+  opacity: 0;
+  pointer-events: none;
+}
+.orb--listening .orb__ripple--1 { animation: orb-ripple 2.4s ease-out infinite; }
+.orb--listening .orb__ripple--2 { animation: orb-ripple 2.4s ease-out infinite 0.8s; }
+.orb--listening .orb__ripple--3 { animation: orb-ripple 2.4s ease-out infinite 1.6s; }
+
+@keyframes orb-breathe {
+  0%, 100% { transform: scale(0.96); }
+  50%      { transform: scale(1.00); }
+}
+@keyframes orb-halo-breathe {
+  0%, 100% { opacity: 0.45; }
+  50%      { opacity: 0.7; }
+}
+@keyframes orb-pulse {
+  0%, 100% { transform: scale(0.93); filter: brightness(0.9); }
+  50%      { transform: scale(0.99); filter: brightness(1.1); }
+}
+@keyframes orb-ripple {
+  0%   { transform: scale(1.0);  opacity: 0.7; border-width: 2px; }
+  80%  { opacity: 0.0; }
+  100% { transform: scale(1.65); opacity: 0; border-width: 0.5px; }
+}
+
+/* =========================================================================
+   Panel — used by in-call console and downloads cards
+   ========================================================================= */
+
+.panel {
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.02) 0%, rgba(255, 255, 255, 0) 50%),
+    var(--color-bg-elevated);
+  border: 1px solid var(--color-border);
+  border-radius: 16px;
+  padding: 32px;
+  position: relative;
+  overflow: hidden;
+}
+.panel::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 1px;
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgba(92, 225, 230, 0.4) 50%,
+    transparent 100%
+  );
+  opacity: 0.6;
+}
+
+/* =========================================================================
+   Transcript v2 — conversation bubbles, not terminal log
+   ========================================================================= */
+
+.transcript-v2 {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 4px;
+}
+
+.transcript-v2__turn {
+  display: flex;
+  max-width: 92%;
+  animation: turn-in 280ms ease-out both;
+}
+
+.transcript-v2__turn--agent { justify-content: flex-start; }
+.transcript-v2__turn--visitor { justify-content: flex-end; align-self: flex-end; }
+.transcript-v2__turn--tool { justify-content: center; max-width: 100%; }
+
+.transcript-v2__bubble {
+  border-radius: 14px;
+  padding: 12px 16px;
+  font: 400 15px/22px var(--font-sans);
+  position: relative;
+}
+
+.transcript-v2__turn--agent .transcript-v2__bubble {
+  background: rgba(92, 225, 230, 0.08);
+  border: 1px solid rgba(92, 225, 230, 0.18);
+  border-top-left-radius: 4px;
+  color: var(--color-fg);
+}
+.transcript-v2__turn--visitor .transcript-v2__bubble {
+  background: var(--color-bg-subtle);
+  border: 1px solid var(--color-border);
+  border-top-right-radius: 4px;
+  color: var(--color-fg);
+}
+.transcript-v2__turn--tool .transcript-v2__bubble {
+  background: transparent;
+  border: 1px dashed var(--color-border-strong);
+  padding: 6px 12px;
+  font: 400 12px/16px var(--font-mono);
+  color: var(--color-fg-faint);
+  letter-spacing: 0.02em;
+}
+
+.transcript-v2__role {
+  font: 500 10px var(--font-mono);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  margin-bottom: 6px;
+  display: block;
+}
+.transcript-v2__turn--agent .transcript-v2__role { color: var(--color-accent); }
+.transcript-v2__turn--visitor .transcript-v2__role { color: var(--color-fg-muted); }
+
+@keyframes turn-in {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+/* =========================================================================
+   Status indicator — the compact pill under the orb
+   ========================================================================= */
+
+.status-indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 16px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid var(--color-border);
+  font: 500 11px var(--font-mono);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--color-fg-muted);
+  transition: color 200ms ease-out, border-color 200ms ease-out;
+}
+.status-indicator__dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  animation: pulse 1.4s ease-in-out infinite;
+}
+.status-indicator--listening { color: var(--color-accent); border-color: rgba(92, 225, 230, 0.3); }
+.status-indicator--thinking  { color: var(--color-accent); border-color: rgba(92, 225, 230, 0.3); }
+.status-indicator--speaking  { color: var(--color-accent-bright); border-color: rgba(130, 240, 244, 0.45); }
+.status-indicator--idle      { color: var(--color-fg-muted); }
+
+/* =========================================================================
+   Download card v2 — artifact preview + big button
+   ========================================================================= */
+
+.dl-card {
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.02), transparent),
+    var(--color-bg-elevated);
+  border: 1px solid var(--color-border);
+  border-radius: 14px;
+  padding: 24px;
+  display: flex;
+  align-items: center;
+  gap: 20px;
+  transition: border-color 200ms ease-out, transform 200ms ease-out;
+}
+.dl-card:hover {
+  border-color: var(--color-accent-deep);
+  transform: translateY(-1px);
+}
+.dl-card__icon {
+  width: 56px;
+  height: 56px;
+  flex-shrink: 0;
+  border-radius: 12px;
+  background:
+    radial-gradient(circle at 40% 30%, rgba(92, 225, 230, 0.3), transparent 60%),
+    var(--color-bg-subtle);
+  border: 1px solid var(--color-border);
+  display: grid;
+  place-items: center;
+  color: var(--color-accent);
+}
+.dl-card__body { flex: 1; min-width: 0; }
+.dl-card__title {
+  font: 500 13px var(--font-mono);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--color-fg);
+  margin-bottom: 4px;
+}
+.dl-card__desc {
+  font: 400 13px/18px var(--font-sans);
+  color: var(--color-fg-muted);
+  margin-bottom: 6px;
+}
+.dl-card__meta {
+  font: 400 11px var(--font-mono);
+  letter-spacing: 0.04em;
+  color: var(--color-fg-faint);
+}
+
+/* =========================================================================
+   Hero — bigger display copy + accent micro-elements
+   ========================================================================= */
+
+.hero-display {
+  font: 600 56px/64px var(--font-sans);
+  letter-spacing: -0.025em;
+  background: linear-gradient(180deg, var(--color-fg) 0%, var(--color-fg-muted) 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+.hero-sub {
+  font: 400 18px/28px var(--font-sans);
+  color: var(--color-fg-muted);
+  max-width: 540px;
+}
+
+/* =========================================================================
    Utility — section divider with mono label
    ========================================================================= */
 

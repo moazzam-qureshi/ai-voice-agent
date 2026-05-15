@@ -31,10 +31,12 @@ def build_agent_settings(
         "audio": {
             "input":  {"encoding": "linear16", "sample_rate": 16000},
             "output": {
+                # mp3 is its own container — adding a `container` field
+                # here returns 400 from Deepgram.
+                # Don't set bitrate: it's only valid for opus, not mp3,
+                # and Deepgram silently fails the speak request if both
+                # are set. Default sample_rate for Aura-2 mp3 is 24kHz.
                 "encoding": "mp3",
-                "sample_rate": 24000,
-                "bitrate": 48000,
-                "container": "none",
             },
         },
         "agent": {
@@ -53,7 +55,10 @@ def build_agent_settings(
                     "temperature": 0.6,
                 },
                 "prompt": system_prompt,
-                "context_length": 8000,
+                # NOTE: context_length is only valid when supplying a
+                # custom think.endpoint. Deepgram's built-in LLM providers
+                # (open_ai/anthropic/etc.) use their own fixed context;
+                # adding this field here returns 400.
                 "functions": [
                     {
                         "name": "search_background",

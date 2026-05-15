@@ -145,6 +145,34 @@ export async function uploadRecording(
   );
 }
 
+/**
+ * Persist a transcript turn server-side. Fire-and-forget: the call still
+ * works if these fail. The worker uses persisted turns for AI summarization
+ * in the PDF.
+ */
+export async function appendTranscriptTurn(
+  callSessionToken: string,
+  turn: { role: "agent" | "visitor" | "tool"; content: string; tsOffsetMs: number },
+): Promise<void> {
+  try {
+    await request<{ persisted: boolean }>("/agent/transcript", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Call-Session-Token": callSessionToken,
+      },
+      body: JSON.stringify({
+        role: turn.role,
+        content: turn.content,
+        ts_offset_ms: turn.tsOffsetMs,
+      }),
+    });
+  } catch (e) {
+    // eslint-disable-next-line no-console
+    console.warn("[api] transcript persist failed", e);
+  }
+}
+
 export async function getCallStatus(callId: string): Promise<CallStatus> {
   return request<CallStatus>(`/calls/${encodeURIComponent(callId)}`, {
     method: "GET",
